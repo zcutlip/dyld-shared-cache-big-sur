@@ -176,6 +176,13 @@ static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t sl
 {
     uintptr_t deltaMask = 0xffffffffffffffff;
     uintptr_t valueAdd = 0;
+    // printf("filePage: %p\n", filePage);
+    // printf("segmentStart: %p\n", segmentStart);
+    // printf("segmentEnd: %p\n", segmentEnd);
+    uint64_t visited = 0;
+    uint64_t adjusted = 0;
+    uint64_t skipped = 0;
+
     if (slideInfo != NULL)
     {
         deltaMask = (uintptr_t)(slideInfo->delta_mask());
@@ -185,7 +192,10 @@ static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t sl
     const unsigned  deltaShift = __builtin_ctzll(deltaMask) - 2;
     uint32_t pageOffset = startOffset;
     uint32_t delta = 1;
+    printf("segmentEnd - segmentStart: %ld\n", (segmentEnd - segmentStart));
     while (delta != 0) {
+        visited++;
+
         uint8_t*  loc = pageContent + pageOffset;
 
         uintptr_t rawValue = *((uintptr_t*)loc);
@@ -215,25 +225,37 @@ static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t sl
         }
 
         //*((uintptr_t*)loc) = value;
-        if (rawValue == 0x20045413F3B || rawValue == 0x00007fff653d9bee) {
-            printf("rawValue: %p\n", (void *)rawValue);
-            printf("adjusted value: %p\n", (void *)value);
-        }
-        printf("values: %p,%p\n", (void*)rawValue, (void*)value);
+
+        // printf("values: %p,%p\n", (void*)rawValue, (void*)value);
         uint8_t* outLoc = filePage + pageOffset;
-        // printf("outLoc: %p\n", outLoc);
-        // printf("*outloc: %p\n", *((uintptr_t*)outLoc));
         if (outLoc >= segmentStart && outLoc < segmentEnd)
         {
             if (*((uintptr_t*)outLoc) != rawValue) {
-                abort();
+                //This shouldn't happen, and I'm not sure why it does
+                //but when it does, it tends to produce invalid libraries
+                printf("Warning: rawValue doesn't match value at outLoc\n");
+                printf("outLoc: %p\n", outLoc);
+                printf("*outloc: %p\n", *((uintptr_t*)outLoc));
+                printf("rawValue: %p\n", (void*)rawValue);
+                skipped++;
+                // abort();
+            }else
+            {
+                *((uintptr_t*)outLoc) = value;
+                slides.addSlide(outLoc);
+                adjusted++;
             }
-            *((uintptr_t*)outLoc) = value;
-            slides.addSlide(outLoc);
+        }else
+        {
+            skipped++;
         }
+        
         //dyld::log("         pageOffset=0x%03X, loc=%p, org value=0x%08llX, new value=0x%08llX, delta=0x%X\n", pageOffset, loc, (uint64_t)rawValue, (uint64_t)value, delta);
         pageOffset += delta;
     }
+    printf("Visited: %llu\n", visited);
+    printf("Adjusted: %llu\n", adjusted);
+    printf("Skipped: %llu\n", skipped);
 }
 
 template <typename A>
