@@ -90,6 +90,20 @@ struct dyld_cache_mapping_info {
 	uint32_t	initProt;
 };
 
+
+// These appear to be identical to dyld_shared_cache_mapping_info
+// Except they've got offsets and sizes of slide info
+typedef struct {
+    uint64_t address;
+    uint64_t size;
+    uint64_t fileOffset;
+    uint64_t slide_info_off;
+    uint64_t slide_info_size;
+    char     skip_0x10[8];
+    uint32_t maxProt;
+    uint32_t initProt;
+} dyld_cache_slide_descriptor;
+
 struct dyld_cache_image_info
 {
 	uint64_t	address;
