@@ -40,7 +40,7 @@
 #include "CodeSigningTypes.h"
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonDigest.h>
-#include "CommonDigestSPI.h"
+#include <CommonCrypto/CommonDigestSPI.h>
 
 #define NO_ULEB
 #include "Architectures.hpp"
@@ -59,9 +59,6 @@
 #include <unordered_map>
 #include <algorithm>
 #include <dispatch/dispatch.h>
-
-#include <string>
-#include <mach/mach.h>
 
 struct seg_info
 {
@@ -113,33 +110,6 @@ private:
     }
     const std::set<int> &_reexportDeps;
 };
-
-template <typename A>
-int fixupObjc(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache) {
-   typedef typename A::P P;
-    const macho_section<P>* methnameSec = mh->getSection("__TEXT", "__objc_methname");
-    if (methnameSec) {
-        // method name to in-memory address
-        std::unordered_map<std::string, uint64_t> methnameToAddr;
-        for (uint64_t off = 0; off < methnameSec->size();) {
-            const char* methname = (const char*)mh + methnameSec->offset() + off;
-            methnameToAddr[methname] = methnameSec->addr() + off;
-            off += strlen(methname) + 1;
-        }
-        if (methnameToAddr.size() > 0) {
-            const macho_section<P>* selrefsSec = mh->getSection("__DATA", "__objc_selrefs");
-            if (selrefsSec) {
-                uint64_t* selrefsArr = (uint64_t*)(((char*)mh) + selrefsSec->offset());
-                for (uint64_t index = 0; index < selrefsSec->size() / sizeof(uint64_t); index++) {
-                    uint64_t selref = selrefsArr[index];
-                    const char* origStr = (const char*)mapped_cache + (selref & 0xffffffffffULL);
-                    selrefsArr[index] = methnameToAddr[origStr];
-                }
-            }
-        }
-    }
-    return 0;
-}
 
 template <typename P>
 struct LoadCommandInfo {
@@ -264,7 +234,7 @@ public:
         mh->set_sizeofcmds(origLoadCommandsSize - bytesRemaining);
     }
 
-    int optimize_linkedit(macho_header<typename A::P>* mh, std::vector<uint8_t> &new_linkedit_data, uint64_t textOffsetInCache, const void* mapped_cache)
+    int optimize_linkedit(std::vector<uint8_t> &new_linkedit_data, uint64_t textOffsetInCache, const void* mapped_cache)
     {
         typedef typename A::P P;
         typedef typename A::P::E E;
@@ -479,8 +449,6 @@ public:
         linkEditSegCmd->set_filesize(symtab->stroff()+symtab->strsize() - linkEditSegCmd->fileoff());
         linkEditSegCmd->set_vmsize( (linkEditSegCmd->filesize()+4095) & (-4096) );
 
-        fixupObjc<A>(mh, textOffsetInCache, mapped_cache);
-
         // <rdar://problem/17671438> Xcode 6 leaks in dyld_shared_cache_extract_dylibs
         for (std::vector<mach_o::trie::Entry>::iterator it = exports.begin(); it != exports.end(); ++it) {
             ::free((void*)(it->name));
@@ -552,7 +520,7 @@ void dylib_maker(const void* mapped_cache, std::vector<uint8_t> &dylib_data, con
     LinkeditOptimizer<A> linkeditOptimizer;
     macho_header<P>* mh = (macho_header<P>*)&new_dylib_data.front();
     linkeditOptimizer.optimize_loadcommands(mh);
-    linkeditOptimizer.optimize_linkedit(mh, new_linkedit_data, textOffsetInCache, mapped_cache);
+    linkeditOptimizer.optimize_linkedit(new_linkedit_data, textOffsetInCache, mapped_cache);
 
     new_dylib_data.insert(new_dylib_data.end(), new_linkedit_data.begin(), new_linkedit_data.end());
 
@@ -794,11 +762,6 @@ int dyld_shared_cache_extract_dylibs_progress(const char* shared_cache_file_path
         fprintf(stderr, "Error: failed to open shared cache file at %s\n", shared_cache_file_path);
         return -1;
     }
-
-    if (fcntl(cache_fd, F_NOCACHE, 1) == -1) {
-         fprintf(stderr, "nocache failed\n");
-         return -1;
-     }
 
     void* mapped_cache = mmap(NULL, (size_t)statbuf.st_size, PROT_READ, MAP_PRIVATE, cache_fd, 0);
     if (mapped_cache == MAP_FAILED) {
