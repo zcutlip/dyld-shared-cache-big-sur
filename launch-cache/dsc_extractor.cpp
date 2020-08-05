@@ -233,10 +233,10 @@ static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t sl
             if (*((uintptr_t*)outLoc) != rawValue) {
                 //This shouldn't happen, and I'm not sure why it does
                 //but when it does, it tends to produce invalid libraries
-                printf("Warning: rawValue doesn't match value at outLoc\n");
-                printf("outLoc: %p\n", outLoc);
-                printf("*outloc: %p\n", *((uintptr_t*)outLoc));
-                printf("rawValue: %p\n", (void*)rawValue);
+                // printf("Warning: rawValue doesn't match value at outLoc\n");
+                // printf("outLoc: %p\n", outLoc);
+                // printf("*outloc: %p\n", *((uintptr_t*)outLoc));
+                // printf("rawValue: %p\n", (void*)rawValue);
                 skipped++;
                 // abort();
             }else
