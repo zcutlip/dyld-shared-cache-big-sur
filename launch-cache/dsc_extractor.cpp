@@ -40,7 +40,7 @@
 #include "CodeSigningTypes.h"
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonDigest.h>
-#include <CommonCrypto/CommonDigestSPI.h>
+// #include <CommonCrypto/CommonDigestSPI.h>
 
 #define NO_ULEB
 #include "Architectures.hpp"
@@ -59,6 +59,9 @@
 #include <unordered_map>
 #include <algorithm>
 #include <dispatch/dispatch.h>
+#include <string>
+#include <mach/mach.h>
+
 
 struct seg_info
 {
@@ -69,6 +72,17 @@ struct seg_info
     uint64_t    sizem;
 };
 
+typedef struct {
+    uint64_t cache_offset;
+    uint64_t cache_segsize;
+    uint64_t dylib_offset;
+} offset_correlator;
+
+typedef struct {
+    uint64_t sect_vmaddr;
+    uint64_t sect_size;
+    uint64_t sect_dylib_offset;
+} section_offset_correlator;
 class CStringHash {
 public:
     size_t operator()(const char* __s) const {
@@ -111,6 +125,236 @@ private:
     const std::set<int> &_reexportDeps;
 };
 
+static void append_uleb128(uint64_t value, std::vector<uint8_t>& out)
+{
+    uint8_t byte;
+    do {
+        byte = value & 0x7F;
+        value &= ~0x7F;
+        if (value != 0)
+            byte |= 0x80;
+        out.push_back(byte);
+        value = value >> 7;
+    } while (byte >= 0x80);
+}
+
+class RebaseMaker {
+public:
+    std::vector<uint8_t> relocs;
+    uintptr_t            segmentStartMapped;
+    uintptr_t            segmentEndMapped;
+    int32_t              currentSegment;
+    RebaseMaker(int32_t _currentSegment, uintptr_t _segmentStartMapped, uintptr_t _segmentEndMapped)
+        : currentSegment(_currentSegment)
+        , segmentStartMapped(_segmentStartMapped)
+        , segmentEndMapped(_segmentEndMapped)
+    {
+        relocs.push_back(REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER);
+    }
+    void addSlide(uint8_t* loc)
+    {
+        uintptr_t l = (uintptr_t)loc;
+        if (l < segmentStartMapped || l >= segmentEndMapped) {
+            abort();
+            return;
+        }
+        addReloc(currentSegment, l - segmentStartMapped);
+    }
+    void addReloc(int32_t segment, uintptr_t segmentOffset)
+    {
+        relocs.push_back(REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment);
+        append_uleb128(segmentOffset, relocs);
+        relocs.push_back(REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1);
+    }
+    void finish()
+    {
+        relocs.push_back(REBASE_OPCODE_DONE);
+    }
+};
+
+static void rebaseChain(uint8_t* pageContent, uint16_t startOffset, uintptr_t slideAmount, const dyldCacheSlideInfo2<LittleEndian>* slideInfo, uint8_t* filePage, uint8_t* segmentStart, uint8_t* segmentEnd, RebaseMaker& slides, std::vector<section_offset_correlator>& section_adjustments)
+{
+    uintptr_t deltaMask = 0xffffffffffffffff;
+    uintptr_t valueAdd = 0;
+    if (slideInfo != NULL)
+    {
+        deltaMask = (uintptr_t)(slideInfo->delta_mask());
+        valueAdd = (uintptr_t)(slideInfo->value_add());
+    }
+    const uintptr_t valueMask = ~deltaMask;
+    const unsigned  deltaShift = __builtin_ctzll(deltaMask) - 2;
+    uint32_t pageOffset = startOffset;
+    uint32_t delta = 1;
+    while (delta != 0) {
+        uint8_t*  loc = pageContent + pageOffset;
+
+        uintptr_t rawValue = *((uintptr_t*)loc);
+
+        delta = (uint32_t)((rawValue & deltaMask) >> deltaShift);
+        // printf("delta: %d\n", delta);
+
+        uintptr_t value = (rawValue & valueMask);
+
+        if(value !=0)
+        {
+         
+            //adjust value to the rebased VMaddr before 
+            //looking up that vmaddr to find the dylib offset adjustment
+            value += valueAdd;
+            value += slideAmount;
+            for(const section_offset_correlator& soc: section_adjustments)
+            {
+                uint64_t sect_start = soc.sect_vmaddr;
+                uint64_t sect_end = sect_start + soc.sect_size;
+                if(value >= sect_start && value < sect_end)
+                {
+                    uint64_t fixup = soc.sect_vmaddr - soc.sect_dylib_offset;
+                    value = value - fixup;
+                }
+            }
+        }
+
+        //*((uintptr_t*)loc) = value;
+        if (rawValue == 0x20045413F3B || rawValue == 0x00007fff653d9bee) {
+            printf("rawValue: %p\n", (void *)rawValue);
+            printf("adjusted value: %p\n", (void *)value);
+        }
+        printf("values: %p,%p\n", (void*)rawValue, (void*)value);
+        uint8_t* outLoc = filePage + pageOffset;
+        // printf("outLoc: %p\n", outLoc);
+        // printf("*outloc: %p\n", *((uintptr_t*)outLoc));
+        if (outLoc >= segmentStart && outLoc < segmentEnd)
+        {
+            if (*((uintptr_t*)outLoc) != rawValue) {
+                abort();
+            }
+            *((uintptr_t*)outLoc) = value;
+            slides.addSlide(outLoc);
+        }
+        //dyld::log("         pageOffset=0x%03X, loc=%p, org value=0x%08llX, new value=0x%08llX, delta=0x%X\n", pageOffset, loc, (uint64_t)rawValue, (uint64_t)value, delta);
+        pageOffset += delta;
+    }
+}
+
+template <typename A>
+std::vector<uint8_t> slideOutput(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache, std::vector<section_offset_correlator>& section_adjustments, std::vector<uint64_t>& saved_vmaddrs)
+{
+    typedef typename A::P P;
+
+    // auto dataSegment = mh->getSegment("__DATA");
+
+    // grab the slide information from the cache
+    const dyldCacheHeader<LittleEndian>*      header = (dyldCacheHeader<LittleEndian>*)mapped_cache;
+    const dyldCacheFileMapping<LittleEndian>* mappings = (dyldCacheFileMapping<LittleEndian>*)((char*)mapped_cache + header->mappingOffset());
+    for(int i=0; i < header->mappingCount(); i++){
+        const dyldCacheFileMapping<LittleEndian>* m = &mappings[i];
+        // m->set_address(m->file_offset)
+        printf("mapping[%d]: address: %p, size:[0x%llx], file_offset: %p\n", i, (void*)m->address(), m->size(), (void *)m->file_offset());
+        printf("saved vmaddr[%d]: %p\n", i, (void *)saved_vmaddrs[i]);
+    }
+    const dyldCacheFileMapping<LittleEndian>* dataMapping = &mappings[1];
+    uint64_t                                  dataStartAddress = dataMapping->address();
+    printf("data start address: %p\n", (void*)dataStartAddress);
+    const dyldCacheSlideInfo<LittleEndian>*   slideInfo = NULL;
+    const dyldCacheSlideInfo2<LittleEndian>*  slideHeader = NULL;
+    uint32_t                            page_size = 0;
+    const uint16_t*                           page_starts = NULL;
+    const uint16_t*                           page_extras = NULL;
+
+
+    if (header->slideInfoSize() > 0)
+    {
+        slideInfo = (dyldCacheSlideInfo<LittleEndian>*)((char*)mapped_cache + header->slideInfoOffset());
+        slideHeader = (dyldCacheSlideInfo2<LittleEndian>*)(slideInfo);
+    }else
+    {
+        printf("Getting slide infos from slide descriptor table\n");
+        
+        uint32_t slide_info_descriptor_offset = header->mappingWithSlideOffset();
+        printf("slide info descriptor offset: 0x%x\n", slide_info_descriptor_offset);
+
+        dyld_cache_slide_descriptor* descriptors
+            = (dyld_cache_slide_descriptor*)((char*)mapped_cache + slide_info_descriptor_offset);
+        for(int i=0; i < header->mappingWithSlideCount(); i++){
+            dyld_cache_slide_descriptor* slide_descriptor = &descriptors[i];
+            if (slide_descriptor->slide_info_size > 0)
+            {
+                printf("slide info descriptor idx: %d\n", i);
+                uint64_t slide_info_offset = slide_descriptor->slide_info_off;
+                printf("Slide info offset: 0x%016llx\n", slide_info_offset);
+                slideInfo = (dyldCacheSlideInfo<LittleEndian>*)((char*)mapped_cache + slide_info_offset);
+                slideHeader = (dyldCacheSlideInfo2<LittleEndian>*)(slideInfo);
+                break;
+            }
+        }
+    }
+
+    if(NULL != slideInfo){
+        page_size = slideHeader->page_size();
+        page_starts = (uint16_t*)((long)(slideInfo) + slideHeader->page_starts_offset());
+        page_extras = (uint16_t*)((long)(slideInfo) + slideHeader->page_extras_offset());
+    }
+
+    auto slide = 0;
+    auto slideOneSegment = [=](const macho_segment_command<P>* segment, int segmentIndex, uint64_t vmaddr, std::vector<section_offset_correlator>& section_adjustments) {
+        auto        segmentInFile = (uint8_t*)mh + segment->fileoff();
+        RebaseMaker rebaseMaker(segmentIndex, (uintptr_t)segmentInFile, (uintptr_t)(segmentInFile + segment->filesize()));
+
+        uint64_t _vmaddr = vmaddr;
+        // uint64_t _vmaddr = segment->vmaddr();
+        printf("_vmaddr: %p\n", (void *)_vmaddr);
+        uint64_t startAddr = _vmaddr - dataStartAddress;
+
+        printf("startAddr: %p\n", (void *)startAddr);
+        uint64_t    startPage = startAddr / 0x1000;
+        uint32_t    startAddrOff = startAddr & 0xfff;
+        printf("startAddrOff: 0x%x\n", startAddrOff);
+        uint64_t    endPage = (((_vmaddr + segment->vmsize() + 0xfffull) & ~0xfffull) - dataStartAddress) / 0x1000;
+        auto        segmentEnd = segmentInFile + segment->filesize();
+        for (uint64_t i = startPage; i < endPage; ++i) {
+            uint8_t* filePage = segmentInFile + ((i - startPage) * 0x1000) - startAddrOff;
+            uint8_t* page = (uint8_t*)mapped_cache + dataMapping->file_offset() + (i * 0x1000);
+            uint16_t pageEntry = 0;
+            if (page_starts != NULL){
+                pageEntry = page_starts[i];
+            }
+            printf("page_starts[%llu]=0x%04X\n", i, pageEntry);
+            if (pageEntry == DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE)
+            {
+                printf("DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE\n");
+                continue;
+            }
+            if (pageEntry & DYLD_CACHE_SLIDE_PAGE_ATTR_EXTRA) {
+                uint16_t chainIndex = (pageEntry & 0x3FFF);
+                bool     done = false;
+                while (!done) {
+                    uint16_t info = page_extras[chainIndex];
+                    uint16_t pageStartOffset = (info & 0x3FFF) * 4;
+                    printf("     chain[%d] pageOffset=0x%03X\n", chainIndex, pageStartOffset);
+                    rebaseChain(page, pageStartOffset, slide, slideHeader, filePage, segmentInFile, segmentEnd, rebaseMaker, section_adjustments);
+                    done = (info & DYLD_CACHE_SLIDE_PAGE_ATTR_END);
+                    ++chainIndex;
+                }
+            } else {
+                uint32_t pageOffset = pageEntry * 4;
+                printf("     start pageOffset=0x%03X\n", pageOffset);
+                rebaseChain(page, pageOffset, slide, slideHeader, filePage, segmentInFile, segmentEnd, rebaseMaker, section_adjustments);
+            }
+        }
+        rebaseMaker.finish();
+        return rebaseMaker.relocs;
+    };
+    printf("sliding __DATA\n");
+    auto ret = slideOneSegment(mh->getSegment("__DATA"), 1, saved_vmaddrs[1], section_adjustments);
+    auto constData = mh->getSegment("__DATA_CONST");
+    if (constData) {
+        printf("sliding __DATA_CONST\n");
+        auto c = slideOneSegment(constData, 2, saved_vmaddrs[2], section_adjustments);
+        ret.insert(ret.end() - 1, c.begin(), c.end());
+    }
+    return ret;
+}
+
 template <typename P>
 struct LoadCommandInfo {
 };
@@ -130,10 +374,11 @@ private:
     uint32_t exportsTrieOffset = 0;
     uint32_t exportsTrieSize = 0;
     std::set<int> reexportDeps;
+    std::vector<section_offset_correlator> section_adjustments;
+
 
 public:
-
-    void optimize_loadcommands(macho_header<typename A::P>* mh)
+    void optimize_loadcommands(macho_header<typename A::P>* mh, uint64_t textOffsetInCache, const void* mapped_cache, const std::vector<seg_info>& segments)
     {
         typedef typename A::P P;
         typedef typename A::P::E E;
@@ -143,16 +388,25 @@ public:
         mh->set_flags(mh->flags() & 0x7FFFFFFF); // remove in-cache bit
 
         // update load commands
+        const dyldCacheHeader<LittleEndian>*      header = (dyldCacheHeader<LittleEndian>*)mapped_cache;
         uint64_t cumulativeFileSize = 0;
         const unsigned origLoadCommandsSize = mh->sizeofcmds();
         unsigned bytesRemaining = origLoadCommandsSize;
         unsigned removedCount = 0;
         const macho_load_command<P>* const cmds = (macho_load_command<P>*)((uint8_t*)mh + sizeof(macho_header<P>));
         const uint32_t cmdCount = mh->ncmds();
+        std::vector<uint64_t> saved_vmaddrs;
+        saved_vmaddrs.reserve(cmdCount);
+        std::vector<offset_correlator> offsets_map;
+        offsets_map.reserve(header->mappingCount());
+        section_adjustments.reserve(255); //max sections
         const macho_load_command<P>* cmd = cmds;
         int depIndex = 0;
+        uint32_t sect_count = 0;
+        macho_dyld_info_command<P>* dyldInfo = NULL;
         for (uint32_t i = 0; i < cmdCount; ++i) {
             bool remove = false;
+
             switch ( cmd->cmd() ) {
                 case macho_segment_command<P>::CMD:
                 {
@@ -163,10 +417,38 @@ public:
                     macho_section<P>* const sectionsStart = (macho_section<P>*)((char*)segCmd + sizeof(macho_segment_command<P>));
                     macho_section<P>* const sectionsEnd = &sectionsStart[segCmd->nsects()];
                     for(macho_section<P>* sect = sectionsStart; sect < sectionsEnd; ++sect) {
+                        uint64_t fileoff = 0;
+                        uint64_t off_into_segment = sect->addr() - segCmd->vmaddr();
+                        fileoff = (cumulativeFileSize + off_into_segment);
+                        // section_adjustments[sect_count] = sect->addr() - fileoff;
+                        section_offset_correlator soc = {sect->addr(), sect->size(), fileoff};
+                        section_adjustments.push_back(soc);
+
+                        sect_count++;
+                        sect->set_addr(fileoff);
                         if ( sect->offset() != 0 )
-                            sect->set_offset((uint32_t)(cumulativeFileSize+sect->addr()-segCmd->vmaddr()));
+                        {
+                            sect->set_offset((uint32_t)fileoff);
+                        }
+                        printf("sect->offset(): 0x%08x\n", sect->offset());
+                        printf("sect->addr(): %p\n", (void *)sect->addr());
                     }
+                    saved_vmaddrs[i] = segCmd->vmaddr();
+                    segCmd->set_vmaddr((cumulativeFileSize + 0xfff) & ~0xfff);
+                    offset_correlator correlator;
+
+                    if(i < segments.size())
+                    {
+                        const seg_info& cache_seg = segments[i];
+                        correlator.cache_offset = cache_seg.offset;
+                        correlator.cache_segsize = cache_seg.sizem;
+                        correlator.dylib_offset = segCmd->fileoff();
+                        offsets_map.push_back(correlator);
+                    }
+
+                    printf("seg vmaddr: %p\n", (void*)segCmd->vmaddr());
                     if ( strcmp(segCmd->segname(), "__LINKEDIT") == 0 ) {
+                        printf("Got linkEditSegCmd\n");
                         linkEditSegCmd = segCmd;
                     }
                     cumulativeFileSize += segCmd->filesize();
@@ -175,7 +457,8 @@ public:
                 case LC_DYLD_INFO_ONLY:
                 {
                     // zero out all dyld info
-                    macho_dyld_info_command<P>* dyldInfo = (macho_dyld_info_command<P>*)cmd;
+                    printf("Got dyldInfo\n");
+                    dyldInfo = (macho_dyld_info_command<P>*)cmd;
                     exportsTrieOffset = dyldInfo->export_off();
                     exportsTrieSize = dyldInfo->export_size();
                     dyldInfo->set_rebase_off(0);
@@ -232,9 +515,62 @@ public:
         // update header
         mh->set_ncmds(cmdCount - removedCount);
         mh->set_sizeofcmds(origLoadCommandsSize - bytesRemaining);
+
+        if(dyldInfo != NULL && linkEditSegCmd != NULL)
+        {
+            // remove the slide linked list from the dyld cache
+            // and generate crappy rebase info
+            std::vector<uint8_t> rebaseInfo = slideOutput<A>(mh, textOffsetInCache, mapped_cache, section_adjustments, saved_vmaddrs);
+
+            // linkEditSegCmd->set_fileoff((linkEditSegCmd->fileoff() + 0xfff) & ~0xfff);
+
+            // const uint64_t newDyldInfoOffset = linkEditSegCmd->fileoff();
+            // uint64_t       newDyldInfoSize = 0;
+
+            //Disabling all this below because it breaks a bunch of things that follow
+            //Not sure if there's a way to recalculate everything elase after we insert this
+
+            //memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->rebase_off(), dyldInfo->rebase_size());
+            // memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, rebaseInfo.data(), rebaseInfo.size());
+            // dyldInfo->set_rebase_size((rebaseInfo.size() + 0x7u) & ~0x7u);
+            // dyldInfo->set_rebase_off(newDyldInfoOffset + newDyldInfoSize);
+            // newDyldInfoSize += dyldInfo->rebase_size();
+
+            // memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->bind_off(), dyldInfo->bind_size());
+            // dyldInfo->set_bind_off(newDyldInfoOffset + newDyldInfoSize);
+            // newDyldInfoSize += dyldInfo->bind_size();
+
+            // memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->lazy_bind_off(), dyldInfo->lazy_bind_size());
+            // dyldInfo->set_lazy_bind_off(newDyldInfoOffset + newDyldInfoSize);
+            // newDyldInfoSize += dyldInfo->lazy_bind_size();
+
+            // memcpy((char*)mh + newDyldInfoOffset + newDyldInfoSize, (char*)mapped_cache + dyldInfo->export_off(), dyldInfo->export_size());
+            // dyldInfo->set_export_off(newDyldInfoOffset + newDyldInfoSize);
+        }
     }
 
-    int optimize_linkedit(std::vector<uint8_t> &new_linkedit_data, uint64_t textOffsetInCache, const void* mapped_cache)
+    void fixup_symtab(std::vector<macho_nlist<P>>& newSymTab, const void* mapped_cache)
+    {
+        uint64_t count = 0;
+        printf("Fixing up symbols\n");
+        for (macho_nlist<P>& s : newSymTab)
+        {
+            if((s.n_type() & N_STAB) == 0){
+
+                if(s.n_type() & N_SECT)
+                {
+                    count++;
+                    section_offset_correlator soc = section_adjustments[s.n_sect()];
+                    uint64_t fixup = soc.sect_vmaddr - soc.sect_dylib_offset;
+                    uint64_t newaddr = s.n_value() - fixup;
+                    s.set_n_value(newaddr);
+                }
+            }
+        }
+        printf("Fixed %llu symbols\n", count);
+    }
+
+    int optimize_linkedit(std::vector<uint8_t>& new_linkedit_data, uint64_t textOffsetInCache, const void* mapped_cache)
     {
         typedef typename A::P P;
         typedef typename A::P::E E;
@@ -259,6 +595,8 @@ public:
         if ( functionStarts != NULL ) {
             // copy function starts from original cache file to new mapped dylib file
             functionStartsSize = functionStarts->datasize();
+            printf("functionStarts->dataoff(): 0x%08x\n", functionStarts->dataoff());
+            printf("functionStartsSize: 0x%x\n", functionStartsSize);
             new_linkedit_data.insert(new_linkedit_data.end(),
                                      (char*)mapped_cache + functionStarts->dataoff(),
                                      (char*)mapped_cache + functionStarts->dataoff() + functionStartsSize);
@@ -292,12 +630,19 @@ public:
         uint32_t localNlistCount = 0;
         const char* localStrings = NULL;
         const char* localStringsEnd = NULL;
-        if ( header->mappingOffset() > offsetof(dyld_cache_header,localSymbolsSize) ) {
+        printf("mappingOffset: 0x%08x\n", header->mappingOffset());
+        printf("offset of localSymbolsSize: %p\n", (void*)offsetof(dyld_cache_header, localSymbolsSize));
+        if ( header->localSymbolsSize() > 0 && header->mappingOffset() > offsetof(dyld_cache_header,localSymbolsSize) ) {
+            printf("localSymbolsOffset: %p\n", (void*)header->localSymbolsOffset());
             dyldCacheLocalSymbolsInfo<E>* localInfo = (dyldCacheLocalSymbolsInfo<E>*)(((uint8_t*)mapped_cache) + header->localSymbolsOffset());
+            printf("localInfo entriesOffset(): 0x%08x\n", localInfo->entriesOffset());
             dyldCacheLocalSymbolEntry<E>* entries = (dyldCacheLocalSymbolEntry<E>*)(((uint8_t*)mapped_cache) + header->localSymbolsOffset() + localInfo->entriesOffset());
             macho_nlist<P>* allLocalNlists = (macho_nlist<P>*)(((uint8_t*)localInfo) + localInfo->nlistOffset());
             const uint32_t entriesCount = localInfo->entriesCount();
+            printf("entriesCount: %d\n", entriesCount);
             for (uint32_t i=0; i < entriesCount; ++i) {
+                printf("dylibOffset: 0x%08x\n", entries[i].dylibOffset());
+                printf("textOffsetInCache: %p\n", (void*)textOffsetInCache);
                 if ( entries[i].dylibOffset() == textOffsetInCache ) {
                     uint32_t localNlistStart = entries[i].nlistStartIndex();
                     localNlistCount = entries[i].nlistCount();
@@ -312,12 +657,17 @@ public:
         const macho_nlist<P>* const mergedSymTabStart = (macho_nlist<P>*)(((uint8_t*)mapped_cache) + symtab->symoff());
         const macho_nlist<P>* const mergedSymTabend = &mergedSymTabStart[symtab->nsyms()];
         uint32_t newSymCount = symtab->nsyms();
+        printf("nsyms: %d\n", symtab->nsyms());
+        printf("symoff: 0x%08x\n", symtab->symoff());
+
         if ( localNlists != NULL ) {
             newSymCount = localNlistCount;
             for (const macho_nlist<P>* s = mergedSymTabStart; s != mergedSymTabend; ++s) {
                 // skip any locals in cache
                 if ( (s->n_type() & (N_TYPE|N_EXT)) == N_SECT )
+                {
                     continue;
+                }
                 ++newSymCount;
             }
         }
@@ -332,6 +682,7 @@ public:
         // First count how many entries we need
         std::vector<macho_nlist<P>> newSymTab;
         newSymTab.reserve(newSymCount);
+
         std::vector<char> newSymNames;
 
         // first pool entry is always empty string
@@ -339,8 +690,9 @@ public:
 
         for (const macho_nlist<P>* s = mergedSymTabStart; s != mergedSymTabend; ++s) {
             // if we have better local symbol info, skip any locals here
-            if ( (localNlists != NULL) && ((s->n_type() & (N_TYPE|N_EXT)) == N_SECT) )
+            if ( (localNlists != NULL) && ((s->n_type() & (N_TYPE|N_EXT)) == N_SECT) ){
                 continue;
+            }
             macho_nlist<P> t = *s;
             t.set_n_strx((uint32_t)newSymNames.size());
             const char* symName = &mergedStringPoolStart[s->n_strx()];
@@ -404,6 +756,8 @@ public:
 
         const uint64_t newSymTabOffset = new_linkedit_data.size();
 
+        fixup_symtab(newSymTab, mapped_cache);
+
         // Copy sym tab
         for (macho_nlist<P>& sym : newSymTab) {
             uint8_t symData[sizeof(macho_nlist<P>)];
@@ -438,6 +792,7 @@ public:
         }
 
         symtab->set_nsyms(newSymCount);
+        printf("symtab offset: 0x%llx\n", (newSymTabOffset + linkEditSegCmd->fileoff()));
         symtab->set_symoff((uint32_t)(newSymTabOffset + linkEditSegCmd->fileoff()));
         symtab->set_stroff((uint32_t)(newStringPoolOffset + linkEditSegCmd->fileoff()));
         symtab->set_strsize((uint32_t)newSymNames.size());
@@ -502,6 +857,7 @@ void dylib_maker(const void* mapped_cache, std::vector<uint8_t> &dylib_data, con
     uint64_t                textOffsetInCache    = 0;
     for( std::vector<seg_info>::const_iterator it=segments.begin(); it != segments.end(); ++it) {
 
+
         if(strcmp(it->segName, "__TEXT") == 0 )
             textOffsetInCache = it->offset;
 
@@ -519,7 +875,7 @@ void dylib_maker(const void* mapped_cache, std::vector<uint8_t> &dylib_data, con
 
     LinkeditOptimizer<A> linkeditOptimizer;
     macho_header<P>* mh = (macho_header<P>*)&new_dylib_data.front();
-    linkeditOptimizer.optimize_loadcommands(mh);
+    linkeditOptimizer.optimize_loadcommands(mh, textOffsetInCache, mapped_cache, segments);
     linkeditOptimizer.optimize_linkedit(new_linkedit_data, textOffsetInCache, mapped_cache);
 
     new_dylib_data.insert(new_dylib_data.end(), new_linkedit_data.begin(), new_linkedit_data.end());
