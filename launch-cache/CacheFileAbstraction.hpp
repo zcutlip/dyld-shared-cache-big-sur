@@ -92,6 +92,14 @@ public:
 	uint64_t		imagesTextCount() const					INLINE { return E::get64(fields.imagesTextCount); }
 	void			set_imagesTextCount(uint64_t value)		INLINE { E::set64(fields.imagesTextCount, value); }
 
+	//TODO: Other accessors?
+
+	uint32_t		mappingWithSlideOffset() const			INLINE { return E::get32(fields.mappingWithSlideOffset); }
+	void			set_mappingWithSlideOffset(uint32_t value)		INLINE { E::set32(fields.mappingWithSlideOffset, value); }
+
+	uint32_t		mappingWithSlideCount() const					INLINE { return E::get32(fields.mappingWithSlideCount); }
+	void			set_mappingWithSlideCount(uint32_t value)		INLINE { E::set32(fields.mappingWithSlideCount, value); }
+
 private:
 	dyld_cache_header			fields;
 };
